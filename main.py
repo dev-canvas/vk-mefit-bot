@@ -115,31 +115,32 @@ PHOTOS_LIST = [
 # Хранилище последних 10 картинок (очередь FIFO)
 last_10_photos = deque(maxlen=10)
 
-def get_unique_photo():
-    """Выбирает картинку, которой не было в последних 10 публикациях"""
+def get_unique_photos(count=3):
+    """Выбирает count уникальных картинок, которых не было в последних 10 публикациях"""
     if len(PHOTOS_LIST) <= 10:
-        # Если картинок мало — просто берём случайную, иначе вообще не сможем выбрать
-        return random.choice(PHOTOS_LIST)
+        # Если картинок мало — просто берём случайные
+        return random.sample(PHOTOS_LIST, min(count, len(PHOTOS_LIST)))
 
     available = [p for p in PHOTOS_LIST if p not in last_10_photos]
-    if not available:
-        # На всякий случай, если вдруг все картинки в истории (маловероятно) — берём любую
-        logger.warning("⚠️ Все картинки в истории последних 10, берём случайную.")
-        return random.choice(PHOTOS_LIST)
-    
-    attachment = random.choice(available)
-    last_10_photos.append(attachment)
-    return attachment
+    if len(available) < count:
+        # На всякий случай, если вдруг не хватает доступных картинок
+        logger.warning("⚠️ Недостаточно уникальных картинок, берём сколько есть.")
+        return random.sample(available, len(available)) if available else [random.choice(PHOTOS_LIST)]
+
+    chosen = random.sample(available, count)
+    for photo in chosen:
+        last_10_photos.append(photo)
+    return chosen
 
 def post_text_with_photo():
-    """Постит текст с готовой картинкой из списка"""
+    """Постит текст с тремя готовыми картинками из списка (карусель)"""
     if not PHOTOS_LIST:
         logger.error("❌ Список картинок пуст! Заполни переменную PHOTOS_LIST в коде.")
         return False
 
-    # Выбираем уникальную картинку (не из последних 10)
-    attachment = get_unique_photo()
-    
+    # Выбираем 3 уникальные картинки (не из последних 10)
+    attachments = get_unique_photos(3)
+
     # Новый текст поста
     message = (
         "Среди всех дел и «надо» я теперь каждый день оставляю одно доброе слово себе — "
@@ -158,7 +159,7 @@ def post_text_with_photo():
             params={
                 "owner_id": GROUP_ID,
                 "message": message,
-                "attachment": attachment,
+                "attachment": ",".join(attachments),
                 "access_token": VK_TOKEN,
                 "v": "5.131"
             },
@@ -172,7 +173,7 @@ def post_text_with_photo():
             return False
         else:
             post_id = result["response"]["post_id"]
-            logger.info(f"✅ УСПЕХ! Пост опубликован. ID: {post_id}, Картинка: {attachment}")
+            logger.info(f"✅ УСПЕХ! Пост опубликован. ID: {post_id}, Картинки: {', '.join(attachments)}")
             return True
 
     except Exception as e:
