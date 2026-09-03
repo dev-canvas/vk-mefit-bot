@@ -53,11 +53,14 @@ def save_schedule(time_str):
 # ── Flask-сервер ─────────────────────────────────────
 app = Flask(__name__)
 CORS(app, resources={
-    r"/api/*": {"origins": [
-        "https://*.github.io",
-        "http://localhost:*",
-        "http://127.0.0.1:*",
-    ]}
+    r"/api/*": {
+        "origins": [
+            "https://dev-canvas.github.io",
+            "http://localhost:*",
+            "http://127.0.0.1:*",
+        ],
+        "supports_credentials": True,
+    }
 })
 
 def check_auth():
