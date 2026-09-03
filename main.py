@@ -71,10 +71,22 @@ def check_auth():
 def get_publish_time():
     if not check_auth():
         return jsonify({"error": "Нет авторизации"}), 401
-    return jsonify({"publish_time": load_schedule()})
+    response = jsonify({"publish_time": load_schedule()})
+    response.headers["Access-Control-Allow-Origin"] = "https://dev-canvas.github.io"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Auth-Token"
+    return response
 
-@app.route("/api/schedule/publish_time", methods=["POST"])
+@app.route("/api/schedule/publish_time", methods=["POST", "OPTIONS"])
 def set_publish_time():
+    # Обработка preflight (OPTIONS)
+    if request.method == "OPTIONS":
+        response = jsonify({"status": "ok"})
+        response.headers["Access-Control-Allow-Origin"] = "https://dev-canvas.github.io"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Auth-Token"
+        return response
+
     if not check_auth():
         return jsonify({"error": "Нет авторизации"}), 401
 
@@ -87,12 +99,17 @@ def set_publish_time():
     if not time_str:
         return jsonify({"error": "Параметр 'time' обязателен"}), 400
 
-    if not re.match(r"^([01]?\d|2[0-3]):[0-5]\d$", time_str):
+    if not re.match(r"^(?\d|2[0-3]):[0-5]\d\$", time_str):
         return jsonify({"error": "Неверный формат. Используйте HH:MM (24ч)"}), 400
 
     save_schedule(time_str)
     logger.info(f"⏰ Время публикации обновлено: {time_str}")
-    return jsonify({"status": "ok", "publish_time": time_str})
+
+    response = jsonify({"status": "ok", "publish_time": time_str})
+    response.headers["Access-Control-Allow-Origin"] = "https://dev-canvas.github.io"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Auth-Token"
+    return response
 
 # ── Список ID картинок ────────────────────────────────
 PHOTOS_LIST = [
