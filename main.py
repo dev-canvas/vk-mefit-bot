@@ -1,18 +1,24 @@
 import os
 import time
+import json
+import re
 import random
 import logging
+import threading
 import requests
 from datetime import datetime, timezone, timedelta
 from collections import deque
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 # Настройка логов
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Получаем переменные
+# ── Переменные окружения ──────────────────────────────
 VK_TOKEN = os.getenv("VK_TOKEN")
 GROUP_ID = os.getenv("GROUP_ID")
+AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
 
 if not VK_TOKEN or not GROUP_ID:
     logger.error("❌ Не заданы переменные окружения!")
@@ -24,9 +30,71 @@ except ValueError:
     logger.error("❌ GROUP_ID должен быть числом")
     exit(1)
 
+if not AUTH_TOKEN:
+    logger.warning("⚠️ AUTH_TOKEN не задан! Авторизация отключена — кто угодно может менять время.")
+
 logger.info(f"✅ Переменные загружены. ID группы: {GROUP_ID}")
 
-# СПИСОК ID КАРТИНОК (твой список)
+# ── Хранилище времени публикации ─────────────────────
+SCHEDULE_FILE = "schedule.json"
+
+def load_schedule():
+    try:
+        with open(SCHEDULE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data.get("publish_time", "06:00")
+    except (FileNotFoundError, json.JSONDecodeError):
+        return "06:00"
+
+def save_schedule(time_str):
+    with open(SCHEDULE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"publish_time": time_str}, f, ensure_ascii=False)
+
+# ── Flask-сервер ─────────────────────────────────────
+app = Flask(__name__)
+CORS(app, resources={
+    r"/api/*": {"origins": [
+        "https://*.github.io",
+        "http://localhost:*",
+        "http://127.0.0.1:*",
+    ]}
+})
+
+def check_auth():
+    """Проверяет заголовок X-Auth-Token. Возвращает True если совпадает или токен не задан."""
+    if not AUTH_TOKEN:
+        return True
+    token = request.headers.get("X-Auth-Token", "")
+    return token == AUTH_TOKEN
+
+@app.route("/api/schedule/publish_time", methods=["GET"])
+def get_publish_time():
+    if not check_auth():
+        return jsonify({"error": "Нет авторизации"}), 401
+    return jsonify({"publish_time": load_schedule()})
+
+@app.route("/api/schedule/publish_time", methods=["POST"])
+def set_publish_time():
+    if not check_auth():
+        return jsonify({"error": "Нет авторизации"}), 401
+
+    data = request.get_json(silent=True)
+    if not data or "time" not in data:
+        time_str = request.form.get("time")
+    else:
+        time_str = data["time"]
+
+    if not time_str:
+        return jsonify({"error": "Параметр 'time' обязателен"}), 400
+
+    if not re.match(r"^([01]?\d|2[0-3]):[0-5]\d$", time_str):
+        return jsonify({"error": "Неверный формат. Используйте HH:MM (24ч)"}), 400
+
+    save_schedule(time_str)
+    logger.info(f"⏰ Время публикации обновлено: {time_str}")
+    return jsonify({"status": "ok", "publish_time": time_str})
+
+# ── Список ID картинок ────────────────────────────────
 PHOTOS_LIST = [
     "photo-239232916_456239539",
     "photo-239232916_456239540",
@@ -109,45 +177,33 @@ PHOTOS_LIST = [
     "photo-239232916_456239617",
     "photo-239232916_456239618",
     "photo-239232916_456239619",
-    "photo-239232916_456239620"
+    "photo-239232916_456239620",
 ]
 
-# Хранилище последних 10 картинок (очередь FIFO)
 last_10_photos = deque(maxlen=10)
 
 def get_unique_photos(count=3):
-    """Выбирает count уникальных картинок, которых не было в последних 10 публикациях"""
     if len(PHOTOS_LIST) <= 10:
-        # Если картинок мало — просто берём случайные
         return random.sample(PHOTOS_LIST, min(count, len(PHOTOS_LIST)))
-
     available = [p for p in PHOTOS_LIST if p not in last_10_photos]
     if len(available) < count:
-        # На всякий случай, если вдруг не хватает доступных картинок
         logger.warning("⚠️ Недостаточно уникальных картинок, берём сколько есть.")
         return random.sample(available, len(available)) if available else [random.choice(PHOTOS_LIST)]
-
     chosen = random.sample(available, count)
     for photo in chosen:
         last_10_photos.append(photo)
     return chosen
 
 def post_text_with_photo():
-    """Постит текст с тремя готовыми картинками из списка (карусель)"""
     if not PHOTOS_LIST:
-        logger.error("❌ Список картинок пуст! Заполни переменную PHOTOS_LIST в коде.")
+        logger.error("❌ Список картинок пуст!")
         return False
-
-    # Выбираем 3 уникальные картинки (не из последних 10)
     attachments = get_unique_photos(3)
-
-    # Новый текст поста
     message = (
         "Листай  👉\n"
         "Выбери 1 или 2 или 3  👉\n"
         "Твоя опора на сегодня ❤️"
     )
-
     try:
         r = requests.post(
             "https://api.vk.com/method/wall.post",
@@ -160,9 +216,7 @@ def post_text_with_photo():
             },
             timeout=10
         )
-        
         result = r.json()
-        
         if "error" in result:
             logger.error(f"❌ Ошибка публикации: {result['error']}")
             return False
@@ -170,43 +224,36 @@ def post_text_with_photo():
             post_id = result["response"]["post_id"]
             logger.info(f"✅ УСПЕХ! Пост опубликован. ID: {post_id}, Картинки: {', '.join(attachments)}")
             return True
-
     except Exception as e:
         logger.exception(f"💥 Критическая ошибка: {e}")
         return False
 
 def get_moscow_time():
-    """Возвращает текущее время по Москве (UTC+3)"""
-    moscow_tz = timezone(timedelta(hours=3))
-    return datetime.now(moscow_tz)
+    return datetime.now(timezone(timedelta(hours=3)))
 
-def main():
-    logger.info("🚀 Бот запущен. Ожидаем 06:00 МСК для публикации...")
-    
-    last_posted_date = None  # чтобы не постить дважды в один день
+def bot_loop():
+    logger.info("🚀 Бот запущен. Читаем время из schedule.json...")
+    last_posted_date = None
 
     while True:
         try:
             now = get_moscow_time()
             current_date = now.date()
-            current_hour = now.hour
-            current_minute = now.minute
+            current_hm = f"{now.hour:02d}:{now.minute:02d}"
 
-            # Проверяем: сейчас 06:00 и это новый день (не публиковали сегодня)
-            if current_hour == 6 and current_minute == 0 and last_posted_date != current_date:
-                logger.info("⏰ Время публикации: 06:00 МСК. Начинаем пост...")
+            publish_time = load_schedule()
+
+            if current_hm == publish_time and last_posted_date != current_date:
+                logger.info(f"⏰ Время публикации: {publish_time} МСК. Начинаем пост...")
                 post_text_with_photo()
                 last_posted_date = current_date
-                # После публикации ждём до следующего 06:00 (чтобы не постить ещё раз в эту же минуту)
                 time.sleep(60)
                 continue
 
-            # Если уже публиковали сегодня — просто ждём дальше
             if last_posted_date == current_date:
                 time.sleep(30)
                 continue
 
-            # В остальное время — спим 30 секунд и проверяем снова
             time.sleep(30)
 
         except KeyboardInterrupt:
@@ -217,4 +264,10 @@ def main():
             time.sleep(10)
 
 if __name__ == "__main__":
-    main()
+    bot_thread = threading.Thread(target=bot_loop, daemon=True)
+    bot_thread.start()
+    logger.info("📡 Бот запущен в фоновом потоке.")
+
+    port = int(os.getenv("PORT", 5000))
+    logger.info(f"🌐 Flask-сервер слушает порт {port}")
+    app.run(host="0.0.0.0", port=port)
