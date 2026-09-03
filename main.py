@@ -102,7 +102,7 @@ def set_publish_time():
     if not time_str:
         return jsonify({"error": "Параметр 'time' обязателен"}), 400
 
-    if not re.match(r"^(?\d|2[0-3]):[0-5]\d\$", time_str):
+    if not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", time_str):
         return jsonify({"error": "Неверный формат. Используйте HH:MM (24ч)"}), 400
 
     save_schedule(time_str)
