@@ -203,8 +203,10 @@ except ValueError as e:
 # ── Flask ─────────────────────────────────────────────
 app = Flask(__name__)
 
+# ВАЖНО: паттерн "/api/.*" (а не "/api/*") — иначе Flask-CORS
+# не вешает заголовки на вложенные пути вроде /api/schedule.
 CORS(app, resources={
-    r"/api/*": {
+    r"/api/.*": {
         "origins": [
             "https://dev-canvas.github.io",
             r"http://localhost:\d+",
@@ -213,8 +215,21 @@ CORS(app, resources={
         "supports_credentials": True,
         "allow_headers": ["Content-Type", "X-Auth-Token"],
         "methods": ["GET", "POST", "OPTIONS"],
+        "expose_headers": ["Content-Type"],
+        "max_age": 86400,
     }
 })
+
+
+@app.before_request
+def _handle_preflight():
+    """
+    Универсальный ответ на preflight (OPTIONS) для всех /api/* маршрутов.
+    Возвращаем 200, чтобы браузер не падал на "Response to preflight
+    request doesn't pass access control check: It does not have HTTP ok status".
+    """
+    if request.method == "OPTIONS" and request.path.startswith("/api/"):
+        return ("", 200)
 
 
 def check_auth() -> bool:
@@ -238,16 +253,20 @@ def _config_response(cfg: dict = None) -> dict:
 
 
 # ── API: весь конфиг ──────────────────────────────────
-@app.route("/api/schedule", methods=["GET"])
+@app.route("/api/schedule", methods=["GET", "OPTIONS"])
 def api_get_schedule():
+    if request.method == "OPTIONS":
+        return ("", 200)
     if not check_auth():
         return jsonify({"error": "Нет авторизации"}), 401
     return jsonify(_config_response())
 
 
 # ── API: время публикации ─────────────────────────────
-@app.route("/api/schedule/publish_time", methods=["GET"])
+@app.route("/api/schedule/publish_time", methods=["GET", "OPTIONS"])
 def api_get_publish_time():
+    if request.method == "OPTIONS":
+        return ("", 200)
     if not check_auth():
         return jsonify({"error": "Нет авторизации"}), 401
     return jsonify({"publish_time": load_config()["publish_time"]})
@@ -256,7 +275,7 @@ def api_get_publish_time():
 @app.route("/api/schedule/publish_time", methods=["POST", "OPTIONS"])
 def api_set_publish_time():
     if request.method == "OPTIONS":
-        return jsonify({"status": "ok"}), 200
+        return ("", 200)
 
     if not check_auth():
         return jsonify({"error": "Нет авторизации"}), 401
@@ -282,7 +301,7 @@ def api_set_publish_time():
 @app.route("/api/schedule/photos", methods=["POST", "OPTIONS"])
 def api_set_photos():
     if request.method == "OPTIONS":
-        return jsonify({"status": "ok"}), 200
+        return ("", 200)
 
     if not check_auth():
         return jsonify({"error": "Нет авторизации"}), 401
