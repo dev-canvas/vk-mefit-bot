@@ -42,11 +42,19 @@ logger.info(f"✅ Переменные загружены. ID группы: {GRO
 # ── Конфиг ────────────────────────────────────────────
 SCHEDULE_FILE = "schedule.json"
 MAX_PHOTOS = 10_000
+POST_TEXT_MAX = 4000
+
+DEFAULT_POST_TEXT = (
+    "Листай  👉\n"
+    "Выбери 1 или 2 или 3  👉\n"
+    "Твоя опора на сегодня ❤️"
+)
 
 DEFAULT_CONFIG = {
     "publish_time": "06:00",
     "photo_first_id": "photo-239232916_456239539",
     "photo_last_id": "photo-239232916_456239620",
+    "post_text": DEFAULT_POST_TEXT,
 }
 
 PHOTO_ID_RE = re.compile(r"^photo(-?\d+)_(\d+)$")
@@ -203,8 +211,6 @@ except ValueError as e:
 # ── Flask ─────────────────────────────────────────────
 app = Flask(__name__)
 
-# ВАЖНО: паттерн "/api/.*" (а не "/api/*") — иначе Flask-CORS
-# не вешает заголовки на вложенные пути вроде /api/schedule.
 CORS(app, resources={
     r"/api/.*": {
         "origins": [
@@ -223,11 +229,7 @@ CORS(app, resources={
 
 @app.before_request
 def _handle_preflight():
-    """
-    Универсальный ответ на preflight (OPTIONS) для всех /api/* маршрутов.
-    Возвращаем 200, чтобы браузер не падал на "Response to preflight
-    request doesn't pass access control check: It does not have HTTP ok status".
-    """
+    """Универсальный ответ на preflight (OPTIONS) для всех /api/* маршрутов."""
     if request.method == "OPTIONS" and request.path.startswith("/api/"):
         return ("", 200)
 
@@ -245,6 +247,8 @@ def _config_response(cfg: dict = None) -> dict:
         "publish_time": cfg["publish_time"],
         "photo_first_id": cfg["photo_first_id"],
         "photo_last_id": cfg["photo_last_id"],
+        "post_text": cfg["post_text"],
+        "post_text_max": POST_TEXT_MAX,
         "photos_count": preview["count"],
         "photos_first": preview["first"],
         "photos_last": preview["last"],
@@ -297,6 +301,51 @@ def api_set_publish_time():
     return jsonify(_config_response(cfg))
 
 
+# ── API: текст поста ──────────────────────────────────
+@app.route("/api/schedule/post_text", methods=["GET", "OPTIONS"])
+def api_get_post_text():
+    if request.method == "OPTIONS":
+        return ("", 200)
+    if not check_auth():
+        return jsonify({"error": "Нет авторизации"}), 401
+    return jsonify({"post_text": load_config()["post_text"]})
+
+
+@app.route("/api/schedule/post_text", methods=["POST", "OPTIONS"])
+def api_set_post_text():
+    if request.method == "OPTIONS":
+        return ("", 200)
+
+    if not check_auth():
+        return jsonify({"error": "Нет авторизации"}), 401
+
+    data = request.get_json(silent=True) or {}
+    text = data.get("text")
+    if text is None:
+        text = request.form.get("text")
+
+    if text is None:
+        return jsonify({"error": "Параметр 'text' обязателен"}), 400
+
+    if not isinstance(text, str):
+        return jsonify({"error": "Параметр 'text' должен быть строкой"}), 400
+
+    # Нормализуем переводы строк и убираем хвостовые пробелы в конце
+    text = text.replace("\r\n", "\n").replace("\r", "\n").rstrip()
+
+    if len(text) > POST_TEXT_MAX:
+        return jsonify({
+            "error": f"Текст слишком длинный: {len(text)} символов (максимум {POST_TEXT_MAX})"
+        }), 400
+
+    cfg = load_config()
+    cfg["post_text"] = text
+    save_config(cfg)
+    logger.info(f"📝 Текст поста обновлён ({len(text)} символов)")
+
+    return jsonify(_config_response(cfg))
+
+
 # ── API: диапазон фото ────────────────────────────────
 @app.route("/api/schedule/photos", methods=["POST", "OPTIONS"])
 def api_set_photos():
@@ -313,19 +362,16 @@ def api_set_photos():
     if not first_id or not last_id:
         return jsonify({"error": "Параметры 'first_id' и 'last_id' обязательны"}), 400
 
-    # 1. Валидация без побочных эффектов
     try:
         photos = generate_photos(first_id, last_id)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    # 2. Сохраняем конфиг
     cfg = load_config()
     cfg["photo_first_id"] = first_id
     cfg["photo_last_id"] = last_id
     save_config(cfg)
 
-    # 3. Применяем к состоянию
     count = photo_state.set_photos(photos)
 
     logger.info(f"🖼️ Диапазон фото обновлён: {first_id} ... {last_id} ({count} шт.)")
@@ -339,11 +385,8 @@ def post_text_with_photo() -> bool:
         logger.error("❌ Нет доступных фото для публикации!")
         return False
 
-    message = (
-        "Листай  👉\n"
-        "Выбери 1 или 2 или 3  👉\n"
-        "Твоя опора на сегодня ❤️"
-    )
+    cfg = load_config()
+    message = cfg.get("post_text", DEFAULT_POST_TEXT)
 
     try:
         r = requests.post(
