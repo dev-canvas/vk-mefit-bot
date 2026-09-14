@@ -43,6 +43,7 @@ logger.info(f"✅ Переменные загружены. ID группы: {GRO
 SCHEDULE_FILE = "schedule.json"
 MAX_PHOTOS = 10_000
 POST_TEXT_MAX = 4000
+MAX_PHOTOS_PER_POST = 10  # лимит ВКонтакте
 
 DEFAULT_POST_TEXT = (
     "Листай  👉\n"
@@ -55,6 +56,9 @@ DEFAULT_CONFIG = {
     "photo_first_id": "photo-239232916_456239539",
     "photo_last_id": "photo-239232916_456239620",
     "post_text": DEFAULT_POST_TEXT,
+    "photo_mode": "random",       # "random" | "sequential"
+    "photos_per_post": 4,          # сколько фото на пост (для sequential)
+    "seq_cursor": 0,               # позиция для sequential-режима
 }
 
 PHOTO_ID_RE = re.compile(r"^photo(-?\d+)_(\d+)$")
@@ -131,18 +135,20 @@ def generate_photos(first_id: str, last_id: str) -> list:
 
 # ── Динамическое состояние ────────────────────────────
 class PhotoState:
-    """Хранит текущий список фото и очередь последних использованных."""
+    """Хранит список фото, очередь последних использованных и курсор для sequential-режима."""
 
     def __init__(self):
         self._lock = threading.Lock()
         self._photos: list = []
         self._last_used: deque = deque(maxlen=10)
+        self._seq_cursor: int = 0
 
     def set_photos(self, photos: list) -> int:
-        """Устанавливает готовый список фото и сбрасывает историю."""
+        """Устанавливает список фото, сбрасывает историю и курсор."""
         with self._lock:
             self._photos = list(photos)
             self._last_used.clear()
+            self._seq_cursor = 0
         return len(self._photos)
 
     def refresh(self, first_id: str, last_id: str) -> int:
@@ -150,7 +156,22 @@ class PhotoState:
         photos = generate_photos(first_id, last_id)
         return self.set_photos(photos)
 
+    def restore_cursor(self, cfg: dict) -> None:
+        """Восстанавливает курсор из конфига (после перезапуска)."""
+        with self._lock:
+            n = len(self._photos)
+            saved = cfg.get("seq_cursor", 0)
+            if n > 0:
+                self._seq_cursor = saved % n
+            else:
+                self._seq_cursor = 0
+
+    def get_cursor(self) -> int:
+        with self._lock:
+            return self._seq_cursor
+
     def get_unique(self, count: int = 3) -> list:
+        """Случайный режим: выбирает уникальные фото."""
         with self._lock:
             photos = self._photos
             last_used = self._last_used
@@ -176,6 +197,33 @@ class PhotoState:
                 last_used.append(p)
             return chosen
 
+    def get_next_batch(self, count: int) -> list:
+        """
+        Sequential-режим: берёт следующие count фото по порядку.
+        Если дошли до конца — зацикливается с начала.
+        """
+        with self._lock:
+            photos = self._photos
+            if not photos:
+                return []
+
+            n = len(photos)
+            count = min(count, n)
+
+            cursor = self._seq_cursor
+            batch = []
+            for i in range(count):
+                batch.append(photos[(cursor + i) % n])
+
+            self._seq_cursor = (cursor + count) % n
+            return batch
+
+    def get_for_post(self, count: int, mode: str) -> list:
+        """Главный метод: выбирает фото в зависимости от режима."""
+        if mode == "sequential":
+            return self.get_next_batch(count)
+        return self.get_unique(count)
+
     def size(self) -> int:
         with self._lock:
             return len(self._photos)
@@ -199,9 +247,11 @@ photo_state = PhotoState()
 _initial_cfg = load_config()
 try:
     photo_state.refresh(_initial_cfg["photo_first_id"], _initial_cfg["photo_last_id"])
+    photo_state.restore_cursor(_initial_cfg)
     logger.info(
         f"🖼️ Загружено {photo_state.size()} фото "
-        f"({_initial_cfg['photo_first_id']} ... {_initial_cfg['photo_last_id']})"
+        f"({_initial_cfg['photo_first_id']} ... {_initial_cfg['photo_last_id']}), "
+        f"режим: {_initial_cfg['photo_mode']}, курсор: {photo_state.get_cursor()}"
     )
 except ValueError as e:
     logger.error(f"❌ Ошибка генерации списка фото из конфига: {e}")
@@ -253,6 +303,8 @@ def _config_response(cfg: dict = None) -> dict:
         "photos_first": preview["first"],
         "photos_last": preview["last"],
         "photos_sample": preview["sample"],
+        "photo_mode": cfg.get("photo_mode", "random"),
+        "photos_per_post": cfg.get("photos_per_post", 4),
     }
 
 
@@ -330,7 +382,6 @@ def api_set_post_text():
     if not isinstance(text, str):
         return jsonify({"error": "Параметр 'text' должен быть строкой"}), 400
 
-    # Нормализуем переводы строк и убираем хвостовые пробелы в конце
     text = text.replace("\r\n", "\n").replace("\r", "\n").rstrip()
 
     if len(text) > POST_TEXT_MAX:
@@ -362,6 +413,23 @@ def api_set_photos():
     if not first_id or not last_id:
         return jsonify({"error": "Параметры 'first_id' и 'last_id' обязательны"}), 400
 
+    # ── Режим выбора фото ──
+    photo_mode = (data.get("photo_mode") or request.form.get("photo_mode") or "random").strip()
+    if photo_mode not in ("random", "sequential"):
+        return jsonify({"error": "photo_mode должен быть 'random' или 'sequential'"}), 400
+
+    photos_per_post = 3
+    if photo_mode == "sequential":
+        raw_n = data.get("photos_per_post") or request.form.get("photos_per_post")
+        try:
+            photos_per_post = int(raw_n) if raw_n is not None else 4
+        except (ValueError, TypeError):
+            return jsonify({"error": "photos_per_post должен быть числом"}), 400
+        if photos_per_post < 1:
+            return jsonify({"error": "photos_per_post должен быть минимум 1"}), 400
+        if photos_per_post > MAX_PHOTOS_PER_POST:
+            return jsonify({"error": f"photos_per_post не может превышать {MAX_PHOTOS_PER_POST} (лимит ВК)"}), 400
+
     try:
         photos = generate_photos(first_id, last_id)
     except ValueError as e:
@@ -370,22 +438,36 @@ def api_set_photos():
     cfg = load_config()
     cfg["photo_first_id"] = first_id
     cfg["photo_last_id"] = last_id
+    cfg["photo_mode"] = photo_mode
+    cfg["photos_per_post"] = photos_per_post
+    cfg["seq_cursor"] = 0  # новый диапазон — курсор в начало
     save_config(cfg)
 
-    count = photo_state.set_photos(photos)
+    count = photo_state.set_photos(photos)  # сбрасывает и курсор, и историю
 
-    logger.info(f"🖼️ Диапазон фото обновлён: {first_id} ... {last_id} ({count} шт.)")
+    logger.info(
+        f"🖼️ Диапазон фото обновлён: {first_id} ... {last_id} ({count} шт.), "
+        f"режим: {photo_mode}, фото/пост: {photos_per_post}"
+    )
     return jsonify(_config_response(cfg))
 
 
 # ── Публикация ────────────────────────────────────────
 def post_text_with_photo() -> bool:
-    attachments = photo_state.get_unique(3)
+    cfg = load_config()
+    photo_mode = cfg.get("photo_mode", "random")
+
+    # В random-режиме всегда 3 фото, в sequential — из конфига
+    if photo_mode == "sequential":
+        photos_per_post = cfg.get("photos_per_post", 4)
+    else:
+        photos_per_post = 3
+
+    attachments = photo_state.get_for_post(photos_per_post, photo_mode)
     if not attachments:
         logger.error("❌ Нет доступных фото для публикации!")
         return False
 
-    cfg = load_config()
     message = cfg.get("post_text", DEFAULT_POST_TEXT)
 
     try:
@@ -407,10 +489,21 @@ def post_text_with_photo() -> bool:
             return False
 
         post_id = result["response"]["post_id"]
-        logger.info(
-            f"✅ УСПЕХ! Пост опубликован. ID: {post_id}, "
-            f"Картинки: {', '.join(attachments)}"
-        )
+
+        # В sequential-режиме сохраняем курсор после успешного поста
+        if photo_mode == "sequential":
+            cfg = load_config()
+            cfg["seq_cursor"] = photo_state.get_cursor()
+            save_config(cfg)
+            logger.info(
+                f"✅ УСПЕХ! Пост {post_id} | режим: sequential | "
+                f"фото: {', '.join(attachments)} | курсор: {cfg['seq_cursor']}"
+            )
+        else:
+            logger.info(
+                f"✅ УСПЕХ! Пост {post_id} | режим: random | "
+                f"фото: {', '.join(attachments)}"
+            )
         return True
 
     except Exception as e:
