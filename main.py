@@ -473,6 +473,7 @@ cleanup_state = {
 
 FLOOD_CONTROL_CODE = 9
 MAX_RETRIES_ON_FLOOD = 5
+EXECUTE_BATCH_SIZE = 25   # лимит VK: до 25 вызовов внутри одного execute
 
 
 def vk_api(method: str, params: dict, token: str = None) -> dict:
@@ -527,6 +528,38 @@ def vk_api(method: str, params: dict, token: str = None) -> dict:
     raise RuntimeError(last_err or "Не удалось выполнить запрос")
 
 
+def vk_execute(code: str, token: str) -> any:
+    """Вызов VK API execute с VKScript-кодом."""
+    if not token:
+        raise RuntimeError("Не задан токен для execute")
+
+    payload = {
+        "code": code,
+        "access_token": token,
+        "v": "5.131",
+    }
+    try:
+        r = requests.post(
+            "https://api.vk.com/method/execute",
+            data=payload,
+            timeout=30,
+        )
+    except requests.RequestException as e:
+        raise RuntimeError(f"Сетевая ошибка execute: {e}")
+
+    try:
+        data = r.json()
+    except ValueError:
+        raise RuntimeError(f"Некорректный JSON от execute: {r.text[:200]}")
+
+    if "error" in data:
+        err = data["error"]
+        raise RuntimeError(
+            f"[{err.get('error_code')}] {err.get('error_msg')}"
+        )
+    return data.get("response")
+
+
 def fetch_all_member_ids(group_id: int) -> list:
     """
     Постранично (по 1000) вытягивает ID всех подписчиков группы.
@@ -556,7 +589,6 @@ def fetch_all_member_ids(group_id: int) -> list:
         if offset >= total or len(items) < count:
             break
 
-        # Пауза между страницами, чтобы не спровоцировать flood control
         time.sleep(0.5)
     return member_ids
 
@@ -585,9 +617,73 @@ def find_inactive_users(user_ids: list) -> list:
         for user in resp:
             if user.get("deactivated"):
                 inactive.append(user["id"])
-        # Небольшая пауза между чанками
         time.sleep(0.4)
     return inactive
+
+
+def remove_users_batched(user_ids: list, token: str,
+                         batch_size: int = EXECUTE_BATCH_SIZE) -> tuple:
+    """
+    Пакетное удаление подписчиков через VK API execute.
+    До 25 вызовов groups.removeUser в одном HTTP-запросе.
+
+    Возвращает кортеж (removed_count, errors_list).
+    Если execute падает целиком (например, VKScript запрещает
+    groups.removeUser внутри execute), для этого батча
+    происходит fallback на поштучное удаление.
+    """
+    removed = 0
+    errors: list = []
+    total_batches = (len(user_ids) + batch_size - 1) // batch_size
+
+    for b_idx, start in enumerate(range(0, len(user_ids), batch_size), start=1):
+        batch = user_ids[start:start + batch_size]
+
+        # VKScript: массив из вызовов groups.removeUser, возвращаем результаты
+        calls = ",".join(
+            f'API.groups.removeUser({{"group_id":{abs(GROUP_ID)},"user_id":{uid}}})'
+            for uid in batch
+        )
+        code = f"return [{calls}];"
+
+        try:
+            result = vk_execute(code, token)
+            if isinstance(result, list):
+                for uid, x in zip(batch, result):
+                    if x == 1:
+                        removed += 1
+                    else:
+                        errors.append(f"{uid}: неожиданный ответ {x}")
+                logger.info(
+                    f"🧹 Батч {b_idx}/{total_batches} (execute, {len(batch)} шт.): "
+                    f"удалено всего {removed}"
+                )
+            else:
+                errors.append(f"batch {b_idx}: неожиданный ответ {result!r}")
+                logger.warning(f"⚠️ Батч {b_idx}: неожиданный ответ {result!r}")
+        except RuntimeError as e:
+            # Весь VKScript упал (например, один removeUser вернул ошибку) —
+            # падаем в поштучный режим только для этого батча.
+            logger.warning(
+                f"⚠️ Батч {b_idx}/{total_batches} через execute не прошёл: {e}. "
+                f"Удаляем {len(batch)} шт. поштучно."
+            )
+            for uid in batch:
+                try:
+                    vk_api("groups.removeUser", {
+                        "group_id": abs(GROUP_ID),
+                        "user_id": uid,
+                    }, token=token)
+                    removed += 1
+                except RuntimeError as ee:
+                    errors.append(f"{uid}: {ee}")
+                    logger.warning(f"⚠️ Не удалось удалить {uid}: {ee}")
+                time.sleep(0.34)
+
+        # Небольшая пауза между батчами
+        time.sleep(0.5)
+
+    return removed, errors
 
 
 def run_cleanup_task():
@@ -626,26 +722,11 @@ def run_cleanup_task():
         result["inactive_found"] = len(inactive_ids)
         logger.info(f"💀 Неактивных найдено: {len(inactive_ids)}")
 
-        # 3. Удаление из группы (CLEAN_TOKEN — user token админа)
-        for idx, uid in enumerate(inactive_ids, start=1):
-            try:
-                vk_api("groups.removeUser", {
-                    "group_id": abs(GROUP_ID),
-                    "user_id": uid,
-                }, token=CLEAN_TOKEN)   # ← только здесь CLEAN_TOKEN
-                result["removed"] += 1
-            except RuntimeError as e:
-                result["errors"].append(f"{uid}: {e}")
-                logger.warning(f"⚠️ Не удалось удалить {uid}: {e}")
-
-            # Flood-контроль (~3 запроса/сек)
-            time.sleep(0.34)
-
-            if idx % 50 == 0:
-                logger.info(
-                    f"🧹 Прогресс: {idx}/{len(inactive_ids)}, "
-                    f"удалено: {result['removed']}"
-                )
+        # 3. Удаление (CLEAN_TOKEN, пакетами через execute)
+        if inactive_ids:
+            removed, remove_errors = remove_users_batched(inactive_ids, CLEAN_TOKEN)
+            result["removed"] = removed
+            result["errors"].extend(remove_errors)
 
         logger.info(
             f"✅ Очистка завершена: всего={result['total_members']}, "
@@ -670,7 +751,6 @@ def api_cleanup_start():
 
     with cleanup_lock:
         if cleanup_state["running"]:
-            # Фронт ищет подстроку "уже" в errors[0] — оставляем как есть
             return jsonify({
                 "running": True,
                 "result": None,
@@ -701,7 +781,6 @@ def post_text_with_photo() -> bool:
     cfg = load_config()
     photo_mode = cfg.get("photo_mode", "random")
 
-    # В random-режиме всегда 3 фото, в sequential — из конфига
     if photo_mode == "sequential":
         photos_per_post = cfg.get("photos_per_post", 4)
     else:
@@ -734,7 +813,6 @@ def post_text_with_photo() -> bool:
 
         post_id = result["response"]["post_id"]
 
-        # В sequential-режиме сохраняем курсор после успешного поста
         if photo_mode == "sequential":
             cfg = load_config()
             cfg["seq_cursor"] = photo_state.get_cursor()
