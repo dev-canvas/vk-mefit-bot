@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 # ── Переменные окружения ──────────────────────────────
 VK_TOKEN = os.getenv("VK_TOKEN")
+CLEAN_TOKEN = os.getenv("CLEAN_TOKEN")
 GROUP_ID_RAW = os.getenv("GROUP_ID")
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
 
@@ -33,6 +34,9 @@ try:
 except ValueError:
     logger.error("❌ GROUP_ID должен быть числом")
     exit(1)
+
+if not CLEAN_TOKEN:
+    logger.warning("⚠️ CLEAN_TOKEN не задан! Очистка подписчиков работать не будет.")
 
 if not AUTH_TOKEN:
     logger.warning("⚠️ AUTH_TOKEN не задан! Авторизация отключена — кто угодно может менять настройки.")
@@ -468,9 +472,17 @@ cleanup_state = {
 }
 
 
-def vk_api(method: str, params: dict) -> dict:
-    """Вызов VK API с обработкой ошибки в теле ответа."""
-    payload = {**params, "access_token": VK_TOKEN, "v": "5.131"}
+def vk_api(method: str, params: dict, token: str = None) -> dict:
+    """
+    Вызов VK API с обработкой ошибки в теле ответа.
+    Если token не передан — используется VK_TOKEN (для постинга).
+    Для очистки подписчиков передаётся CLEAN_TOKEN.
+    """
+    use_token = token or VK_TOKEN
+    if not use_token:
+        raise RuntimeError("Не задан токен для вызова VK API")
+
+    payload = {**params, "access_token": use_token, "v": "5.131"}
     r = requests.post(
         f"https://api.vk.com/method/{method}",
         data=payload,
@@ -495,7 +507,7 @@ def fetch_all_member_ids(group_id: int) -> list:
             "group_id": abs(group_id),
             "offset": offset,
             "count": count,
-        })
+        }, token=CLEAN_TOKEN)
         if not isinstance(resp, dict):
             break
         items = resp.get("items", []) or []
@@ -522,7 +534,7 @@ def find_inactive_users(user_ids: list) -> list:
             resp = vk_api("users.get", {
                 "user_ids": ",".join(str(u) for u in batch),
                 "fields": "deactivated",
-            })
+            }, token=CLEAN_TOKEN)
         except RuntimeError as e:
             logger.warning(f"⚠️ users.get ошибка: {e}")
             continue
@@ -542,6 +554,15 @@ def run_cleanup_task():
         "removed": 0,
         "errors": [],
     }
+
+    if not CLEAN_TOKEN:
+        result["errors"].append("CLEAN_TOKEN не задан — очистка невозможна")
+        logger.error("❌ CLEAN_TOKEN не задан, очистка отменена")
+        with cleanup_lock:
+            cleanup_state["running"] = False
+            cleanup_state["result"] = result
+        return result
+
     try:
         logger.info("🧹 Начинаем очистку подписчиков…")
 
@@ -567,7 +588,7 @@ def run_cleanup_task():
                 vk_api("groups.removeUser", {
                     "group_id": abs(GROUP_ID),
                     "user_id": uid,
-                })
+                }, token=CLEAN_TOKEN)
                 result["removed"] += 1
             except RuntimeError as e:
                 result["errors"].append(f"{uid}: {e}")
