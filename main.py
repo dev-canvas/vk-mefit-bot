@@ -36,7 +36,7 @@ except ValueError:
     exit(1)
 
 if not CLEAN_TOKEN:
-    logger.warning("⚠️ CLEAN_TOKEN не задан! Очистка подписчиков работать не будет.")
+    logger.warning("⚠️ CLEAN_TOKEN не задан! Удаление подписчиков работать не будет.")
 
 if not AUTH_TOKEN:
     logger.warning("⚠️ AUTH_TOKEN не задан! Авторизация отключена — кто угодно может менять настройки.")
@@ -471,43 +471,77 @@ cleanup_state = {
     "result": None,   # {"total_members", "inactive_found", "removed", "errors": []}
 }
 
+FLOOD_CONTROL_CODE = 9
+MAX_RETRIES_ON_FLOOD = 5
+
 
 def vk_api(method: str, params: dict, token: str = None) -> dict:
     """
     Вызов VK API с обработкой ошибки в теле ответа.
-    Если token не передан — используется VK_TOKEN (для постинга).
-    Для очистки подписчиков передаётся CLEAN_TOKEN.
+    При ошибке 9 (Flood control) — ждёт и повторяет запрос
+    с экспоненциальной задержкой.
+
+    Если token не передан — используется VK_TOKEN.
     """
     use_token = token or VK_TOKEN
     if not use_token:
         raise RuntimeError("Не задан токен для вызова VK API")
 
     payload = {**params, "access_token": use_token, "v": "5.131"}
-    r = requests.post(
-        f"https://api.vk.com/method/{method}",
-        data=payload,
-        timeout=20,
-    )
-    data = r.json()
-    if "error" in data:
+    url = f"https://api.vk.com/method/{method}"
+
+    last_err = None
+    for attempt in range(MAX_RETRIES_ON_FLOOD + 1):
+        try:
+            r = requests.post(url, data=payload, timeout=20)
+        except requests.RequestException as e:
+            raise RuntimeError(f"Сетевая ошибка: {e}")
+
+        try:
+            data = r.json()
+        except ValueError:
+            raise RuntimeError(f"Некорректный JSON от VK: {r.text[:200]}")
+
+        if "error" not in data:
+            return data.get("response")
+
         err = data["error"]
-        raise RuntimeError(
-            f"[{err.get('error_code')}] {err.get('error_msg')}"
-        )
-    return data.get("response")
+        code = err.get("error_code")
+        msg = err.get("error_msg", "")
+
+        # Flood control — ждём и пробуем снова
+        if code == FLOOD_CONTROL_CODE:
+            last_err = f"[{code}] {msg}"
+            if attempt >= MAX_RETRIES_ON_FLOOD:
+                break
+            wait = 2 ** (attempt + 1)  # 2, 4, 8, 16, 32 сек
+            logger.warning(
+                f"⏳ Flood control на {method}, попытка {attempt + 1}/"
+                f"{MAX_RETRIES_ON_FLOOD}, ждём {wait}с…"
+            )
+            time.sleep(wait)
+            continue
+
+        raise RuntimeError(f"[{code}] {msg}")
+
+    raise RuntimeError(last_err or "Не удалось выполнить запрос")
 
 
 def fetch_all_member_ids(group_id: int) -> list:
-    """Постранично (по 1000) вытягивает ID всех подписчиков группы."""
+    """
+    Постранично (по 1000) вытягивает ID всех подписчиков группы.
+    Использует VK_TOKEN (group token) — метод доступен с group auth.
+    """
     member_ids: list = []
     offset = 0
     count = 1000
+    page = 0
     while True:
         resp = vk_api("groups.getMembers", {
             "group_id": abs(group_id),
             "offset": offset,
             "count": count,
-        }, token=CLEAN_TOKEN)
+        })  # токен по умолчанию — VK_TOKEN
         if not isinstance(resp, dict):
             break
         items = resp.get("items", []) or []
@@ -516,33 +550,43 @@ def fetch_all_member_ids(group_id: int) -> list:
         member_ids.extend(items)
         total = resp.get("count", 0)
         offset += len(items)
+        page += 1
+        logger.info(f"📄 Страница {page}: получено {len(items)}, всего {offset}/{total}")
+
         if offset >= total or len(items) < count:
             break
+
+        # Пауза между страницами, чтобы не спровоцировать flood control
+        time.sleep(0.5)
     return member_ids
 
 
 def find_inactive_users(user_ids: list) -> list:
     """
     Возвращает тех, у кого выставлен флаг `deactivated`
-    ("banned" или "deleted"), — это и есть «удалён или забанен админами ВК».
+    ("banned" или "deleted").
+    Использует VK_TOKEN (group token) — users.get доступен с group auth.
     """
     inactive: list = []
     chunk = 1000
-    for i in range(0, len(user_ids), chunk):
+    total_chunks = (len(user_ids) + chunk - 1) // chunk
+    for idx, i in enumerate(range(0, len(user_ids), chunk), start=1):
         batch = user_ids[i:i + chunk]
         try:
             resp = vk_api("users.get", {
                 "user_ids": ",".join(str(u) for u in batch),
                 "fields": "deactivated",
-            }, token=CLEAN_TOKEN)
+            })  # токен по умолчанию — VK_TOKEN
         except RuntimeError as e:
-            logger.warning(f"⚠️ users.get ошибка: {e}")
+            logger.warning(f"⚠️ users.get ошибка (чанк {idx}/{total_chunks}): {e}")
             continue
         if not isinstance(resp, list):
             continue
         for user in resp:
             if user.get("deactivated"):
                 inactive.append(user["id"])
+        # Небольшая пауза между чанками
+        time.sleep(0.4)
     return inactive
 
 
@@ -556,7 +600,7 @@ def run_cleanup_task():
     }
 
     if not CLEAN_TOKEN:
-        result["errors"].append("CLEAN_TOKEN не задан — очистка невозможна")
+        result["errors"].append("CLEAN_TOKEN не задан — удаление невозможно")
         logger.error("❌ CLEAN_TOKEN не задан, очистка отменена")
         with cleanup_lock:
             cleanup_state["running"] = False
@@ -566,7 +610,7 @@ def run_cleanup_task():
     try:
         logger.info("🧹 Начинаем очистку подписчиков…")
 
-        # 1. Все подписчики
+        # 1. Все подписчики (VK_TOKEN)
         try:
             all_ids = fetch_all_member_ids(GROUP_ID)
         except RuntimeError as e:
@@ -577,18 +621,18 @@ def run_cleanup_task():
         result["total_members"] = len(all_ids)
         logger.info(f"👥 Всего подписчиков: {len(all_ids)}")
 
-        # 2. Неактивные (удалённые / забаненные ВК)
+        # 2. Неактивные (VK_TOKEN)
         inactive_ids = find_inactive_users(all_ids)
         result["inactive_found"] = len(inactive_ids)
         logger.info(f"💀 Неактивных найдено: {len(inactive_ids)}")
 
-        # 3. Удаление из группы
+        # 3. Удаление из группы (CLEAN_TOKEN — user token админа)
         for idx, uid in enumerate(inactive_ids, start=1):
             try:
                 vk_api("groups.removeUser", {
                     "group_id": abs(GROUP_ID),
                     "user_id": uid,
-                }, token=CLEAN_TOKEN)
+                }, token=CLEAN_TOKEN)   # ← только здесь CLEAN_TOKEN
                 result["removed"] += 1
             except RuntimeError as e:
                 result["errors"].append(f"{uid}: {e}")
