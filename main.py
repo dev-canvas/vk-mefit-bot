@@ -528,8 +528,15 @@ def vk_api(method: str, params: dict, token: str = None) -> dict:
     raise RuntimeError(last_err or "Не удалось выполнить запрос")
 
 
-def vk_execute(code: str, token: str) -> any:
-    """Вызов VK API execute с VKScript-кодом."""
+def vk_execute(code: str, token: str) -> tuple:
+    """
+    Вызов VK API execute с VKScript-кодом.
+
+    Возвращает (response, execute_errors):
+      - response: результат выполнения кода (список или значение);
+      - execute_errors: список ошибок отдельных вызовов внутри execute
+        (пустой, если всё прошло без ошибок).
+    """
     if not token:
         raise RuntimeError("Не задан токен для execute")
 
@@ -552,12 +559,16 @@ def vk_execute(code: str, token: str) -> any:
     except ValueError:
         raise RuntimeError(f"Некорректный JSON от execute: {r.text[:200]}")
 
+    # Ошибка уровня всего execute (невалидный VKScript, нет прав и т.п.)
     if "error" in data:
         err = data["error"]
         raise RuntimeError(
             f"[{err.get('error_code')}] {err.get('error_msg')}"
         )
-    return data.get("response")
+
+    response = data.get("response")
+    execute_errors = data.get("execute_errors", []) or []
+    return response, execute_errors
 
 
 def fetch_all_member_ids(group_id: int) -> list:
@@ -628,9 +639,12 @@ def remove_users_batched(user_ids: list, token: str,
     До 25 вызовов groups.removeUser в одном HTTP-запросе.
 
     Возвращает кортеж (removed_count, errors_list).
-    Если execute падает целиком (например, VKScript запрещает
-    groups.removeUser внутри execute), для этого батча
-    происходит fallback на поштучное удаление.
+
+    Логика разбора ответа:
+      - response — список из 1 (успех) и False (ошибка) для каждого user_id;
+      - execute_errors — детали ошибок для тех позиций, где response = False.
+        Порядок ошибок в execute_errors соответствует порядку неудачных
+        вызовов, поэтому мы сопоставляем их по индексам.
     """
     removed = 0
     errors: list = []
@@ -647,23 +661,9 @@ def remove_users_batched(user_ids: list, token: str,
         code = f"return [{calls}];"
 
         try:
-            result = vk_execute(code, token)
-            if isinstance(result, list):
-                for uid, x in zip(batch, result):
-                    if x == 1:
-                        removed += 1
-                    else:
-                        errors.append(f"{uid}: неожиданный ответ {x}")
-                logger.info(
-                    f"🧹 Батч {b_idx}/{total_batches} (execute, {len(batch)} шт.): "
-                    f"удалено всего {removed}"
-                )
-            else:
-                errors.append(f"batch {b_idx}: неожиданный ответ {result!r}")
-                logger.warning(f"⚠️ Батч {b_idx}: неожиданный ответ {result!r}")
+            result, exec_errors = vk_execute(code, token)
         except RuntimeError as e:
-            # Весь VKScript упал (например, один removeUser вернул ошибку) —
-            # падаем в поштучный режим только для этого батча.
+            # Весь execute упал целиком — fallback на поштучное удаление
             logger.warning(
                 f"⚠️ Батч {b_idx}/{total_batches} через execute не прошёл: {e}. "
                 f"Удаляем {len(batch)} шт. поштучно."
@@ -679,8 +679,44 @@ def remove_users_batched(user_ids: list, token: str,
                     errors.append(f"{uid}: {ee}")
                     logger.warning(f"⚠️ Не удалось удалить {uid}: {ee}")
                 time.sleep(0.34)
+            time.sleep(0.5)
+            continue
 
-        # Небольшая пауза между батчами
+        # Ошибки внутри execute могут быть, даже если сам execute прошёл.
+        # Сопоставляем их с конкретными user_id по позиции в batch.
+        err_idx = 0
+        if isinstance(result, list):
+            batch_failed = 0
+            for uid, x in zip(batch, result):
+                if x == 1:
+                    removed += 1
+                else:
+                    batch_failed += 1
+                    if err_idx < len(exec_errors):
+                        ee = exec_errors[err_idx]
+                        err_idx += 1
+                        code_ = ee.get("error_code")
+                        msg_ = ee.get("error_msg", "unknown")
+                        errors.append(f"{uid}: [{code_}] {msg_}")
+                    else:
+                        errors.append(f"{uid}: неожиданный ответ {x}")
+            logger.info(
+                f"🧹 Батч {b_idx}/{total_batches} (execute, {len(batch)} шт.): "
+                f"удалено всего {removed}, ошибок в батче: {batch_failed}"
+            )
+        else:
+            errors.append(f"batch {b_idx}: неожиданный ответ {result!r}")
+            logger.warning(f"⚠️ Батч {b_idx}: неожиданный ответ {result!r}")
+
+        # Если после разбора остались «лишние» execute_errors —
+        # зафиксируем их как ошибки уровня execute.
+        while err_idx < len(exec_errors):
+            ee = exec_errors[err_idx]
+            err_idx += 1
+            errors.append(
+                f"execute: [{ee.get('error_code')}] {ee.get('error_msg')}"
+            )
+
         time.sleep(0.5)
 
     return removed, errors
