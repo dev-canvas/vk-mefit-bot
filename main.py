@@ -261,26 +261,34 @@ except ValueError as e:
 # ── Flask ─────────────────────────────────────────────
 app = Flask(__name__)
 
+# ── CORS ──────────────────────────────────────────────
+_CORS_OPTS = {
+    "origins": [
+        "https://dev-canvas.github.io",
+        r"http://localhost:\d+",
+        r"http://127\.0\.0\.1:\d+",
+    ],
+    "supports_credentials": True,
+    "allow_headers": ["Content-Type", "X-Auth-Token"],
+    "methods": ["GET", "POST", "OPTIONS"],
+    "expose_headers": ["Content-Type"],
+    "max_age": 86400,
+}
+
 CORS(app, resources={
-    r"/api/.*": {
-        "origins": [
-            "https://dev-canvas.github.io",
-            r"http://localhost:\d+",
-            r"http://127\.0\.0\.1:\d+",
-        ],
-        "supports_credentials": True,
-        "allow_headers": ["Content-Type", "X-Auth-Token"],
-        "methods": ["GET", "POST", "OPTIONS"],
-        "expose_headers": ["Content-Type"],
-        "max_age": 86400,
-    }
+    r"/api/.*": _CORS_OPTS,
+    r"/clean":  _CORS_OPTS,
+    r"/status": _CORS_OPTS,
 })
 
 
 @app.before_request
 def _handle_preflight():
-    """Универсальный ответ на preflight (OPTIONS) для всех /api/* маршрутов."""
-    if request.method == "OPTIONS" and request.path.startswith("/api/"):
+    """Универсальный ответ на preflight (OPTIONS)."""
+    if request.method == "OPTIONS" and (
+        request.path.startswith("/api/")
+        or request.path in ("/clean", "/status")
+    ):
         return ("", 200)
 
 
@@ -450,6 +458,177 @@ def api_set_photos():
         f"режим: {photo_mode}, фото/пост: {photos_per_post}"
     )
     return jsonify(_config_response(cfg))
+
+
+# ── Очистка неактивных подписчиков ────────────────────
+cleanup_lock = threading.Lock()
+cleanup_state = {
+    "running": False,
+    "result": None,   # {"total_members", "inactive_found", "removed", "errors": []}
+}
+
+
+def vk_api(method: str, params: dict) -> dict:
+    """Вызов VK API с обработкой ошибки в теле ответа."""
+    payload = {**params, "access_token": VK_TOKEN, "v": "5.131"}
+    r = requests.post(
+        f"https://api.vk.com/method/{method}",
+        data=payload,
+        timeout=20,
+    )
+    data = r.json()
+    if "error" in data:
+        err = data["error"]
+        raise RuntimeError(
+            f"[{err.get('error_code')}] {err.get('error_msg')}"
+        )
+    return data.get("response")
+
+
+def fetch_all_member_ids(group_id: int) -> list:
+    """Постранично (по 1000) вытягивает ID всех подписчиков группы."""
+    member_ids: list = []
+    offset = 0
+    count = 1000
+    while True:
+        resp = vk_api("groups.getMembers", {
+            "group_id": abs(group_id),
+            "offset": offset,
+            "count": count,
+        })
+        if not isinstance(resp, dict):
+            break
+        items = resp.get("items", []) or []
+        if not items:
+            break
+        member_ids.extend(items)
+        total = resp.get("count", 0)
+        offset += len(items)
+        if offset >= total or len(items) < count:
+            break
+    return member_ids
+
+
+def find_inactive_users(user_ids: list) -> list:
+    """
+    Возвращает тех, у кого выставлен флаг `deactivated`
+    ("banned" или "deleted"), — это и есть «удалён или забанен админами ВК».
+    """
+    inactive: list = []
+    chunk = 1000
+    for i in range(0, len(user_ids), chunk):
+        batch = user_ids[i:i + chunk]
+        try:
+            resp = vk_api("users.get", {
+                "user_ids": ",".join(str(u) for u in batch),
+                "fields": "deactivated",
+            })
+        except RuntimeError as e:
+            logger.warning(f"⚠️ users.get ошибка: {e}")
+            continue
+        if not isinstance(resp, list):
+            continue
+        for user in resp:
+            if user.get("deactivated"):
+                inactive.append(user["id"])
+    return inactive
+
+
+def run_cleanup_task():
+    """Фоновая задача: найти и выкинуть из сообщества неактивных подписчиков."""
+    result = {
+        "total_members": 0,
+        "inactive_found": 0,
+        "removed": 0,
+        "errors": [],
+    }
+    try:
+        logger.info("🧹 Начинаем очистку подписчиков…")
+
+        # 1. Все подписчики
+        try:
+            all_ids = fetch_all_member_ids(GROUP_ID)
+        except RuntimeError as e:
+            result["errors"].append(f"groups.getMembers: {e}")
+            logger.error(f"❌ groups.getMembers: {e}")
+            return result
+
+        result["total_members"] = len(all_ids)
+        logger.info(f"👥 Всего подписчиков: {len(all_ids)}")
+
+        # 2. Неактивные (удалённые / забаненные ВК)
+        inactive_ids = find_inactive_users(all_ids)
+        result["inactive_found"] = len(inactive_ids)
+        logger.info(f"💀 Неактивных найдено: {len(inactive_ids)}")
+
+        # 3. Удаление из группы
+        for idx, uid in enumerate(inactive_ids, start=1):
+            try:
+                vk_api("groups.removeUser", {
+                    "group_id": abs(GROUP_ID),
+                    "user_id": uid,
+                })
+                result["removed"] += 1
+            except RuntimeError as e:
+                result["errors"].append(f"{uid}: {e}")
+                logger.warning(f"⚠️ Не удалось удалить {uid}: {e}")
+
+            # Flood-контроль (~3 запроса/сек)
+            time.sleep(0.34)
+
+            if idx % 50 == 0:
+                logger.info(
+                    f"🧹 Прогресс: {idx}/{len(inactive_ids)}, "
+                    f"удалено: {result['removed']}"
+                )
+
+        logger.info(
+            f"✅ Очистка завершена: всего={result['total_members']}, "
+            f"неактивных={result['inactive_found']}, "
+            f"удалено={result['removed']}, "
+            f"ошибок={len(result['errors'])}"
+        )
+    except Exception as e:
+        logger.exception(f"💥 Критическая ошибка при очистке: {e}")
+        result["errors"].append(f"Критическая ошибка: {e}")
+    finally:
+        with cleanup_lock:
+            cleanup_state["running"] = False
+            cleanup_state["result"] = result
+    return result
+
+
+@app.route("/clean", methods=["POST", "OPTIONS"])
+def api_cleanup_start():
+    if request.method == "OPTIONS":
+        return ("", 200)
+
+    with cleanup_lock:
+        if cleanup_state["running"]:
+            # Фронт ищет подстроку "уже" в errors[0] — оставляем как есть
+            return jsonify({
+                "running": True,
+                "result": None,
+                "errors": ["Задача очистки уже выполняется"],
+            }), 200
+        cleanup_state["running"] = True
+        cleanup_state["result"] = None
+
+    threading.Thread(target=run_cleanup_task, daemon=True).start()
+    logger.info("🚀 Запущена фоновая задача очистки подписчиков")
+    return jsonify({"running": True, "result": None, "errors": []}), 200
+
+
+@app.route("/status", methods=["GET", "OPTIONS"])
+def api_cleanup_status():
+    if request.method == "OPTIONS":
+        return ("", 200)
+
+    with cleanup_lock:
+        return jsonify({
+            "running": cleanup_state["running"],
+            "result": cleanup_state["result"],
+        })
 
 
 # ── Публикация ────────────────────────────────────────
